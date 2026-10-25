@@ -1,0 +1,163 @@
+name: Build CheatStore-VN IPA
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      ipa_name:
+        description: "Tên file IPA xuất ra (không cần đuôi .ipa)"
+        required: false
+        default: "CheatStore-VN"
+      build_config:
+        description: "Chế độ biên dịch"
+        required: false
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - Debug
+      xcode_version:
+        description: "Phiên bản Xcode (để trống = mới nhất)"
+        required: false
+        default: "latest"
+
+jobs:
+  build:
+    name: Biên dịch và Đóng gói IPA
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Kiểm tra mã nguồn (Checkout)
+        uses: actions/checkout@v4
+
+      - name: Chọn phiên bản Xcode
+        run: |
+          if [ "${{ github.event.inputs.xcode_version }}" != "latest" ] && [ -n "${{ github.event.inputs.xcode_version }}" ]; then
+            sudo xcode-select -s /Applications/Xcode_${{ github.event.inputs.xcode_version }}.app || {
+              echo "⚠️ Xcode ${{ github.event.inputs.xcode_version }} không tìm thấy, dùng bản mặc định"
+              ls /Applications/ | grep Xcode
+            }
+          fi
+          echo "=== Xcode đang sử dụng ==="
+          xcodebuild -version
+          echo "=== SDK có sẵn ==="
+          xcodebuild -showsdks | grep iphoneos
+
+      - name: Liệt kê Schemes có sẵn
+        run: |
+          xcodebuild -project ThreeOneOSFive.xcodeproj -list
+
+      - name: Biên dịch ứng dụng (xcodebuild)
+        run: |
+          BUILD_CONFIG="${{ github.event.inputs.build_config || 'Release' }}"
+          echo "🔨 Biên dịch chế độ: $BUILD_CONFIG"
+
+          # Tự động chọn scheme ưu tiên CheatStore
+          SCHEME="CheatStore"
+          if ! xcodebuild -project ThreeOneOSFive.xcodeproj -list | grep -q "CheatStore"; then
+            SCHEME="3105"
+          fi
+          echo "🎯 Đang build với Scheme: $SCHEME"
+
+          set -o pipefail
+          xcodebuild -project ThreeOneOSFive.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration "$BUILD_CONFIG" \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PRODUCT_BUNDLE_IDENTIFIER="com.apple.mobile.MobileHouseArrest" \
+            build 2>&1 | tee xcodebuild.log || {
+              echo ""
+              echo "::error title=Xcode Build Failed::Biên dịch thất bại"
+              echo ""
+              echo "==================== LỖI BIÊN DỊCH ===================="
+              grep -A 2 "error:" xcodebuild.log | head -60 || tail -n 100 xcodebuild.log
+              echo "======================================================="
+              exit 1
+            }
+
+          echo "✅ Biên dịch thành công!"
+
+      - name: Đóng gói thành file IPA
+        run: |
+          BUILD_CONFIG="${{ github.event.inputs.build_config || 'Release' }}"
+          APP_DIR="build/Build/Products/${BUILD_CONFIG}-iphoneos"
+
+          # Tìm file .app
+          APP_PATH=$(find "$APP_DIR" -name "*.app" -maxdepth 1 | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::Không tìm thấy file .app trong $APP_DIR"
+            ls -la "$APP_DIR" || echo "Thư mục không tồn tại"
+            exit 1
+          fi
+          echo "📦 Tìm thấy app: $APP_PATH"
+
+          # Tạo Payload sạch sẽ
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/CheatStore-VN.app
+          TARGET_APP="Payload/CheatStore-VN.app"
+
+          # 1. Cập nhật Info.plist cho CheatStore VN
+          if [ -f "$TARGET_APP/Info.plist" ]; then
+            plutil -replace CFBundleDisplayName -string "CheatStore VN" "$TARGET_APP/Info.plist" 2>/dev/null || true
+            plutil -replace CFBundleName -string "CheatStore VN" "$TARGET_APP/Info.plist" 2>/dev/null || true
+            plutil -replace CFBundleShortVersionString -string "2.4" "$TARGET_APP/Info.plist" 2>/dev/null || true
+            plutil -replace CFBundleVersion -string "10" "$TARGET_APP/Info.plist" 2>/dev/null || true
+          fi
+
+          # 2. Bundle localConfig.json và Assembly-CSharp-patch.bytes
+          mkdir -p "$TARGET_APP/AppCore/new123"
+          if [ -f "ThreeOneOSFive/localConfig.json" ]; then
+            cp -v "ThreeOneOSFive/localConfig.json" "$TARGET_APP/" 2>/dev/null || true
+            cp -v "ThreeOneOSFive/localConfig.json" "$TARGET_APP/AppCore/new123/" 2>/dev/null || true
+          fi
+          if [ -f "ThreeOneOSFive/Assembly-CSharp-patch.bytes" ]; then
+            cp -v "ThreeOneOSFive/Assembly-CSharp-patch.bytes" "$TARGET_APP/" 2>/dev/null || true
+            cp -v "ThreeOneOSFive/Assembly-CSharp-patch.bytes" "$TARGET_APP/AppCore/new123/" 2>/dev/null || true
+          fi
+
+          # 3. Gom tài nguyên phụ trợ vào AppCore
+          if [ -d "ThreeOneOSFive/AppCore" ]; then
+            cp -rv ThreeOneOSFive/AppCore/* "$TARGET_APP/AppCore/" 2>/dev/null || true
+          fi
+
+          # Đóng gói IPA CheatStore-VN
+          IPA_FILENAME="${{ github.event.inputs.ipa_name || 'CheatStore-VN' }}.ipa"
+          zip -r -9 "$IPA_FILENAME" Payload
+          
+          # Tính checksum
+          SHA256=$(shasum -a 256 "$IPA_FILENAME" | awk '{print $1}')
+          IPA_SIZE=$(du -h "$IPA_FILENAME" | awk '{print $1}')
+
+          echo "IPA_PATH=$IPA_FILENAME" >> $GITHUB_ENV
+          echo "IPA_SHA256=$SHA256" >> $GITHUB_ENV
+
+          echo ""
+          echo "============================================"
+          echo "✅ ĐÃ TẠO THÀNH CÔNG: $IPA_FILENAME"
+          echo "📏 Kích thước: $IPA_SIZE"
+          echo "🔐 SHA-256: $SHA256"
+          echo "============================================"
+
+      - name: Lưu trữ file IPA CheatStore-VN lên GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CheatStore-VN-IPA
+          path: "${{ env.IPA_PATH }}"
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Lưu build log (nếu lỗi)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          retention-days: 7
