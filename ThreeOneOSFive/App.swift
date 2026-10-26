@@ -19,6 +19,7 @@ struct ThreeOneOSFiveApp: App {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init() {
+        licenseManager.isActivated = true
         setupLogCapture()
         log("app: CheatStore VN launching — iOS \(AppInfo.osVersion) (\(AppInfo.osBuild)) \(AppInfo.machineName)")
         
@@ -39,14 +40,10 @@ struct ThreeOneOSFiveApp: App {
     }
 
     // MARK: - CheatStore VN Root View
-    @ViewBuilder
-    private var mainContentView: some View {
-        if licenseManager.isActivated {
-            New3105MainView()
-        } else {
-            CheatStoreLoginView(licenseManager: licenseManager)
-        }
-    }
+   @ViewBuilder
+private var mainContentView: some View {
+    New3105MainView()
+}
 
     var body: some Scene {
         WindowGroup {
